@@ -1,0 +1,5 @@
+numpy==2.3.5
+opencv-contrib-python==5.0.0.93
+Pillow==12.0.0
+# 打包工具（源码运行时不需要；离线环境可预先下载 wheel）
+# pyinstaller==6.16.0

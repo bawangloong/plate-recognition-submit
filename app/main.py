@@ -1,0 +1,14 @@
+# -*- coding: utf-8 -*-
+"""GUI 启动模块。"""
+
+from __future__ import annotations
+
+from .gui import run
+
+
+def main() -> int:
+    return run()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
