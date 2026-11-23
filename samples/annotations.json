@@ -1,0 +1,52 @@
+{
+  "source": "tools/make_demo_images.py 合成时写入的号码。识别率按 text 计，不要按检测顺序配对。",
+  "images": [
+    {
+      "file": "normal_blue.png",
+      "plates": [
+        {"text": "京A12345", "color": "blue", "char_count": 7}
+      ]
+    },
+    {
+      "file": "tilt_yellow.png",
+      "plates": [
+        {"text": "粤B88888", "color": "yellow", "char_count": 7}
+      ]
+    },
+    {
+      "file": "multi_two.png",
+      "plates": [
+        {"text": "京A12345", "color": "blue", "char_count": 7},
+        {"text": "沪AD12345", "color": "green", "char_count": 8}
+      ]
+    },
+    {
+      "file": "no_plate.png",
+      "plates": []
+    },
+    {
+      "file": "green_8.png",
+      "plates": [
+        {"text": "沪AD12345", "color": "green", "char_count": 8}
+      ]
+    },
+    {
+      "file": "blur_glare.png",
+      "plates": [
+        {"text": "京A12345", "color": "white", "char_count": 7}
+      ]
+    },
+    {
+      "file": "black_plate.png",
+      "plates": [
+        {"text": "京A88888", "color": "black", "char_count": 7}
+      ]
+    },
+    {
+      "file": "large_3000.jpg",
+      "plates": [
+        {"text": "京A12345", "color": "blue", "char_count": 7}
+      ]
+    }
+  ]
+}
