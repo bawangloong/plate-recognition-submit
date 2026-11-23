@@ -29,10 +29,10 @@ def _pipeline():
 
 
 def _align_plate(plate: dict) -> dict:
-    """把内部结果收成评测读取的字段。
+    """框从 ``[x, y, w, h]`` 收成 ``{x, y, w, h}``。
 
-    框从 ``[x, y, w, h]`` 改成 ``{x, y, w, h}``，颜色从字典改成
-    ``blue`` 这类字符串，字数放到 ``char_count``。
+    颜色仍是字典，评测读 ``color.color``。
+    字数仍在 ``segmentation.count``。
     """
     aligned = dict(plate)
     box = plate.get("bbox") or [0, 0, 0, 0]
@@ -44,19 +44,6 @@ def _align_plate(plate: dict) -> dict:
     else:
         x, y, w, h = (int(v) for v in list(box)[:4])
     aligned["bbox"] = {"x": x, "y": y, "w": w, "h": h}
-
-    color = plate.get("color")
-    if isinstance(color, dict):
-        aligned["color"] = str(color.get("color") or "unknown")
-        aligned["color_detail"] = color
-    elif color is None:
-        aligned["color"] = "unknown"
-    else:
-        aligned["color"] = str(color)
-
-    segmentation = plate.get("segmentation") or {}
-    count = segmentation.get("count", 0) if isinstance(segmentation, dict) else 0
-    aligned["char_count"] = int(count or 0)
     return aligned
 
 
@@ -67,8 +54,8 @@ def run(image_path):
         image_path: 图片路径，支持中文路径。
     返回
         可直接 ``json.dumps`` 的结果字典。``plates`` 里每块牌的
-        ``bbox`` 是 ``{x, y, w, h}``，``color`` 是颜色字符串，
-        ``char_count`` 是字符数。
+        ``bbox`` 是 ``{x, y, w, h}``，颜色在 ``color.color``，
+        字数在 ``segmentation.count``。
     """
     from app.pipeline import result_to_json
 
