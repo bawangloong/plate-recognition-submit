@@ -168,8 +168,12 @@ def _clean(bw):
     labels, n = connected_components(bw)
     keep = np.zeros_like(bw)
     for (cid, x, y, ww, hh, area) in component_boxes(labels, n):
-        # 贴边：整块被裁掉（边框）
-        if x <= 1 or y <= 1 or x + ww >= w - 1 or y + hh >= h - 1:
+        # 贴上下边的是边框。只贴左右边、又够高的，多半是被裁到边缘的字符，保留。
+        touches_tb = y <= 1 or y + hh >= h - 1
+        touches_lr = x <= 1 or x + ww >= w - 1
+        if touches_tb:
+            continue
+        if touches_lr and not (hh > 0.40 * h and ww >= max(3.0, 0.04 * w)):
             continue
         # 噪点
         if area < 0.0008 * h * w:
@@ -244,6 +248,81 @@ def _merge_and_split(segs, bw, target_w):
     return out
 
 
+def _boxes_from_projection(bw, min_char_width_ratio):
+    """对一块二值图做垂直投影，返回该图坐标系里的字符框。"""
+    h, w = bw.shape
+    if h < 8 or w < 8:
+        return []
+    target_w = 0.55 * h                      # 车牌字符宽约为这一行高度的 0.5~0.6
+    segs = _project_segments(bw)
+    segs = _merge_and_split(segs, bw, target_w)
+    boxes = []
+    for (x0, x1) in segs:
+        sub = bw[:, x0:x1 + 1]
+        ys, xs = np.where(sub)
+        if len(ys) == 0:
+            continue
+        y0, y1 = ys.min(), ys.max()
+        hh = y1 - y0 + 1
+        ww = x1 - x0 + 1
+        if hh < 0.32 * h:
+            continue
+        if ww < max(3.0, min_char_width_ratio * target_w):
+            continue
+        boxes.append((int(x0), int(y0), int(ww), int(hh)))
+    boxes.sort(key=lambda b: b[0])
+    return boxes
+
+
+def _tighten_single_row(boxes):
+    """单行牌上，个别框被铆钉或边框拉高时，收回同一条字带。"""
+    if len(boxes) < 4:
+        return boxes
+    top = max(b[1] for b in boxes)
+    bot = min(b[1] + b[3] for b in boxes)
+    height = max(b[3] for b in boxes)
+    if bot - top <= 0.5 * height:
+        return boxes
+    tops = sorted(b[1] for b in boxes)
+    bots = sorted(b[1] + b[3] for b in boxes)
+    med_top = tops[len(tops) // 2]
+    med_bot = bots[len(bots) // 2]
+    band = max(8, med_bot - med_top)
+    tightened = []
+    for x, y, w, h in boxes:
+        y1 = y + h
+        if y < med_top - 0.12 * band:
+            y = med_top
+        if y1 > med_bot + 0.12 * band:
+            y1 = med_bot
+        if y1 - y > 4:
+            tightened.append((x, y, w, y1 - y))
+    return tightened or boxes
+
+
+def _two_row_cut(bw):
+    """双行牌在中部有一条更空的横带。单行牌长宽比更大，不在这里切开。"""
+    h, w = bw.shape
+    if h < 24 or w / float(h) >= 2.45:
+        return None
+    row = bw.mean(axis=1)
+    k = max(3, h // 20)
+    if k % 2 == 0:
+        k += 1
+    smooth = np.convolve(row, np.ones(k) / k, mode="same")
+    lo, hi = int(h * 0.34), int(h * 0.66)
+    if hi <= lo + 2:
+        return None
+    cut = lo + int(np.argmin(smooth[lo:hi]))
+    top_peak = float(smooth[int(h * 0.12):int(h * 0.34)].max())
+    bot_peak = float(smooth[int(h * 0.66):int(h * 0.88)].max())
+    if min(top_peak, bot_peak) < 0.04:
+        return None
+    if smooth[cut] > 0.55 * min(top_peak, bot_peak):
+        return None
+    return int(cut)
+
+
 def segment_plate(img, assume_bgr=False, prefer_dark_text=None, debug=False,
                   min_char_width_ratio=0.25):
     """
@@ -280,28 +359,19 @@ def segment_plate(img, assume_bgr=False, prefer_dark_text=None, debug=False,
     bw = morph(bw, 3, "close")
     bw = _clean(bw)
 
-    h, w = bw.shape
-    target_w = 0.55 * h                      # 车牌字符宽约为车高的 0.5~0.6
-    segs = _project_segments(bw)
-    segs = _merge_and_split(segs, bw, target_w)
-
-    # 过滤：高度太小（小圆点、噪点）或过窄
-    boxes = []
-    for (x0, x1) in segs:
-        sub = bw[:, x0:x1 + 1]
-        ys, xs = np.where(sub)
-        if len(ys) == 0:
-            continue
-        y0, y1 = ys.min(), ys.max()
-        hh = y1 - y0 + 1
-        ww = x1 - x0 + 1
-        if hh < 0.32 * h:                    # 字符高一般在车高的 40%~70%
-            continue
-        if ww < max(3.0, min_char_width_ratio * target_w):  # 过窄（小圆点、噪点、断笔）
-            continue
-        boxes.append((int(x0), int(y0), int(ww), int(hh)))
-
-    boxes.sort(key=lambda b: b[0])
+    boxes = _boxes_from_projection(bw, min_char_width_ratio)
+    cut = _two_row_cut(bw)
+    if cut is not None:
+        top = _boxes_from_projection(bw[:cut], min_char_width_ratio)
+        bottom = [
+            (x, y + cut, w, h)
+            for (x, y, w, h) in _boxes_from_projection(bw[cut:], min_char_width_ratio)
+        ]
+        two_row = top + bottom
+        # 双行牌按整张图做垂直投影会把上下两字叠成一块。切开后字数更多时采用切开的结果。
+        if len(two_row) > len(boxes):
+            boxes = two_row
+    boxes = _tighten_single_row(boxes)
 
     chars = []
     for (x, y, ww, hh) in boxes:
@@ -319,7 +389,7 @@ def segment_plate(img, assume_bgr=False, prefer_dark_text=None, debug=False,
     result = {"chars": chars, "boxes": boxes, "count": count, "status": status}
     if debug:
         result["stages"] = {"norm": norm, "gray": gray, "bw": bw,
-                            "segs": segs, "polarity": polarity}
+                            "polarity": polarity}
     return result
 
 
