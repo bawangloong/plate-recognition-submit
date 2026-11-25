@@ -585,7 +585,155 @@ def detect_plates(image_bgr: np.ndarray, verbose: bool = False) -> list:
         max_area = max(r.bbox[2] * r.bbox[3] for r, _, _ in kept)
         kept = [(r, ch, cc) for r, ch, cc in kept
                 if not (cc < 6 and r.bbox[2] * r.bbox[3] < 0.2 * max_area)]
-    return [r for r, _, _ in kept]
+    trimmed = []
+    for region, ch, cc in kept:
+        region = _trim_stacked_cap(image_bgr, region)
+        trimmed.append(region)
+    extra = _yellow_glyph_rows(image_bgr, trimmed)
+    return trimmed + extra
+
+
+def _solid_runs(fill: np.ndarray, level: float):
+    runs = []
+    start = None
+    for index, flag in enumerate(fill >= level):
+        if flag and start is None:
+            start = index
+        elif not flag and start is not None:
+            runs.append((start, index))
+            start = None
+    if start is not None:
+        runs.append((start, len(fill)))
+    return runs
+
+
+def _trim_stacked_cap(image_bgr: np.ndarray, region):
+    """黄牌上面如果还粘着另一排黄字，只留下下面那块实心底色。
+
+    双行黄牌上下都是实心黄底，中间只是一条浅缝，这里整块保留。
+    """
+    if region.color_hint not in {"yellow", "green"}:
+        return region
+    x, y, w, h = (int(v) for v in region.bbox)
+    if h < 24 or w < 40 or y < 0 or x < 0:
+        return region
+    y1, x1 = min(image_bgr.shape[0], y + h), min(image_bgr.shape[1], x + w)
+    if y1 - y < 24 or x1 - x < 40:
+        return region
+    hsv = cv2.cvtColor(image_bgr[y:y1, x:x1], cv2.COLOR_BGR2HSV)
+    if region.color_hint == "yellow":
+        mask = cv2.inRange(hsv, (15, 80, 70), (40, 255, 255))
+    else:
+        mask = cv2.inRange(hsv, (35, 40, 40), (95, 255, 255))
+    fill = mask.mean(axis=1) / 255.0
+    height = len(fill)
+    runs = _solid_runs(fill, 0.50)
+    if not runs:
+        return region
+    main = max(runs, key=lambda item: item[1] - item[0])
+    above = [item for item in runs if item[1] <= main[0]]
+    if not above:
+        return region
+    prev = above[-1]
+    # 上面那一段如果本身就很高，是双行牌的上一行，不能切掉。
+    if (prev[1] - prev[0]) > 0.18 * height:
+        return region
+    gap = fill[prev[1]:main[0]]
+    if len(gap) < max(2, int(0.015 * height)) or float(np.min(gap)) > 0.20:
+        return region
+    if int(np.count_nonzero(gap < 0.25)) < 3:
+        return region
+    top = main[0] / float(height)
+    bottom = main[1] / float(height)
+    if bottom - top < 0.45:
+        return region
+    quad = np.array(region.quad, dtype=np.float32)
+    def slide(a, b, frac):
+        return a + (b - a) * frac
+    quad[0] = slide(quad[0], quad[3], top)
+    quad[1] = slide(quad[1], quad[2], top)
+    quad[3] = slide(np.array(region.quad[0], dtype=np.float32), quad[3], bottom)
+    quad[2] = slide(np.array(region.quad[1], dtype=np.float32), quad[2], bottom)
+    xs, ys = quad[:, 0], quad[:, 1]
+    nx = max(0, int(math.floor(xs.min())))
+    ny = max(0, int(math.floor(ys.min())))
+    nw = min(image_bgr.shape[1] - nx, int(math.ceil(xs.max())) - nx)
+    nh = min(image_bgr.shape[0] - ny, int(math.ceil(ys.max())) - ny)
+    if nw < 40 or nh < 16:
+        return region
+    return PlateRegion(bbox=(nx, ny, nw, nh), quad=quad.tolist(),
+                       angle=region.angle, score=region.score,
+                       color_hint=region.color_hint)
+
+
+def _yellow_glyph_rows(image_bgr: np.ndarray, existing: list):
+    """黑底上的一行黄字。实心黄牌已经由颜色通道检出，这里不再收进去。"""
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (12, 70, 70), (40, 255, 255))
+    count, _, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    height, width = mask.shape
+    glyphs = []
+    for index in range(1, count):
+        x, y, w, h, area = (int(v) for v in stats[index])
+        if h < 14 or h > 0.10 * height or w < 5:
+            continue
+        if w > h * 1.7 or h > w * 3.5:
+            continue
+        if area < 0.34 * w * h:
+            continue
+        glyphs.append((x, y, w, h))
+    glyphs.sort(key=lambda item: item[1] + item[3] / 2.0)
+    rows = []
+    for glyph in glyphs:
+        center = glyph[1] + glyph[3] / 2.0
+        placed = False
+        for row in rows:
+            centers = [item[1] + item[3] / 2.0 for item in row]
+            med_h = float(np.median([item[3] for item in row]))
+            if abs(center - sum(centers) / len(centers)) <= 0.55 * med_h:
+                row.append(glyph)
+                placed = True
+                break
+        if not placed:
+            rows.append([glyph])
+    found = []
+    for row in rows:
+        if len(row) < 5:
+            continue
+        med_h = float(np.median([item[3] for item in row]))
+        row = [item for item in row if 0.65 * med_h <= item[3] <= 1.45 * med_h]
+        if len(row) < 5:
+            continue
+        heights = [item[3] for item in row]
+        if max(heights) > 1.7 * min(heights):
+            continue
+        x0 = min(item[0] for item in row)
+        y0 = min(item[1] for item in row)
+        x1 = max(item[0] + item[2] for item in row)
+        y1 = max(item[1] + item[3] for item in row)
+        bw, bh = x1 - x0, y1 - y0
+        if bh < 14 or not 2.4 <= bw / float(bh) <= 7.5:
+            continue
+        fill = float(mask[y0:y1, x0:x1].mean()) / 255.0
+        if fill > 0.55:
+            continue
+        background = hsv[y0:y1, x0:x1]
+        dark = background[:, :, 2] < 90
+        if dark.mean() < 0.35:
+            continue
+        pad_x = int(round(bh * 0.15))
+        pad_y = int(round(bh * 0.20))
+        nx = max(0, x0 - pad_x)
+        ny = max(0, y0 - pad_y)
+        nw = min(width - nx, x1 - x0 + 2 * pad_x)
+        nh = min(height - ny, y1 - y0 + 2 * pad_y)
+        box = (nx, ny, nw, nh)
+        if any(_iou_quad_bbox(box, region.bbox) > 0.25 for region in existing):
+            continue
+        quad = [[nx, ny], [nx + nw - 1, ny], [nx + nw - 1, ny + nh - 1], [nx, ny + nh - 1]]
+        found.append(PlateRegion(bbox=box, quad=quad, angle=0.0, score=0.66,
+                                 color_hint="yellow"))
+    return found
 
 
 def draw_regions(image_bgr: np.ndarray, regions: list) -> np.ndarray:

@@ -413,6 +413,7 @@ class ABackend:
                 "quad": np.asarray(quad, dtype=np.float32) if quad is not None else None,
                 "detect_score": float(data.get("score", 0.5)),
                 "plate_score": float(data.get("score", 0.5)),
+                "color_hint": data.get("color_hint", "unknown"),
                 "source": "a_module",
                 "_region": region,
             })

@@ -162,6 +162,39 @@ def _normalize_size(img):
     return np.array(pil.resize((nw, STD_H), Image.LANCZOS))
 
 
+def _peel_edge_bridge(bw):
+    """去掉贴着上下边、只有两三行高的横线。
+
+    黄牌顶上的细线会把左右两个字母粘成一块，整块又因为贴边被删掉。
+    字符本身从顶上一直铺到牌高中部，前几行里没有这种凹下去的空隙，这里不动它。
+    """
+    h, w = bw.shape
+    if h < 24 or w < 16:
+        return bw
+    out = bw.copy()
+    cap = max(3, int(round(h * 0.04)))
+
+    for reverse in (False, True):
+        fills = out.mean(axis=1)
+        if reverse:
+            fills = fills[::-1]
+        saw = False
+        valley = None
+        for i in range(cap):
+            if fills[i] > 0.15:
+                saw = True
+            if saw and fills[i] < 0.12:
+                valley = i
+                break
+        if valley is None or valley == 0:
+            continue
+        if reverse:
+            out[h - valley:] = False
+        else:
+            out[:valley] = False
+    return out
+
+
 def _clean(bw):
     """去除接触边框的连通域、铆钉与小噪点"""
     h, w = bw.shape
@@ -169,10 +202,18 @@ def _clean(bw):
     keep = np.zeros_like(bw)
     for (cid, x, y, ww, hh, area) in component_boxes(labels, n):
         # 贴上下边的是边框。只贴左右边、又够高的，多半是被裁到边缘的字符，保留。
+        # 裁得很紧时，字符头顶会碰到上边。这种块又窄又高，不是横框，留下。
         touches_tb = y <= 1 or y + hh >= h - 1
         touches_lr = x <= 1 or x + ww >= w - 1
         if touches_tb:
-            continue
+            character_like = (
+                not touches_lr
+                and hh > 0.42 * h
+                and max(3.0, 0.03 * w) <= ww <= 0.22 * w
+                and area > 0.004 * h * w
+            )
+            if not character_like:
+                continue
         if touches_lr and not (hh > 0.40 * h and ww >= max(3.0, 0.04 * w)):
             continue
         # 噪点
@@ -246,6 +287,88 @@ def _merge_and_split(segs, bw, target_w):
                     out.append((a, b))
         else:
             out.append((x0, x1))
+    return out
+
+
+def _local_dark(gray):
+    """按水平位置分别取阈值。绿牌从左到右变暗时，整张图一个阈值会吃掉中间的字。"""
+    height, width = gray.shape
+    window = max(15, int(round(width * 0.16)))
+    if window % 2 == 0:
+        window += 1
+    acc = np.zeros(width, dtype=np.float64)
+    weight = np.zeros(width, dtype=np.float64)
+    step = max(1, window // 4)
+    for x in range(0, width, step):
+        x0 = max(0, x - window // 2)
+        x1 = min(width, x0 + window)
+        if x1 - x0 < 8:
+            continue
+        acc[x0:x1] += otsu_threshold(gray[:, x0:x1])
+        weight[x0:x1] += 1
+    if weight.max() <= 0:
+        return gray <= otsu_threshold(gray)
+    threshold = acc / np.maximum(weight, 1.0)
+    return gray <= threshold[None, :]
+
+
+def _split_wide_boxes(bw, boxes):
+    """一个投影框里若并排躺着好几个字，按连通域拆开。
+
+    倾斜牌的相邻字在垂直投影上会叠在一起。汉字的左右部首也是多个连通域，
+    但它们叠得很深，并且合起来并不比旁边的字宽，这里不拆。
+    """
+    if not boxes:
+        return boxes
+    height, width = bw.shape
+    labels, n = connected_components(bw)
+    pieces = []
+    for _cid, x, y, ww, hh, area in component_boxes(labels, n):
+        if hh < 0.35 * height or ww > 0.40 * width or ww < 3:
+            continue
+        if area < 0.001 * height * width:
+            continue
+        pieces.append((x, y, ww, hh))
+    if len(pieces) < 2:
+        return boxes
+    widths = sorted(b[2] for b in boxes)
+    median = widths[len(widths) // 2]
+    if len(boxes) == 1:
+        median = max(median * 0.5, 0.42 * boxes[0][3])
+    if median < 4:
+        return boxes
+    out = []
+    for x, y, bw_, bh in boxes:
+        if bw_ <= 1.65 * median:
+            out.append((x, y, bw_, bh))
+            continue
+        inside = []
+        for cx, cy, cw, ch in pieces:
+            overlap_x = min(x + bw_, cx + cw) - max(x, cx)
+            overlap_y = min(y + bh, cy + ch) - max(y, cy)
+            if overlap_x > 0.55 * cw and overlap_y > 0.55 * ch:
+                inside.append((cx, cy, cw, ch))
+        inside.sort(key=lambda item: item[0])
+        merged = []
+        for cc in inside:
+            if not merged:
+                merged.append(list(cc))
+                continue
+            px, py, pw, ph = merged[-1]
+            overlap = min(px + pw, cc[0] + cc[2]) - max(px, cc[0])
+            if overlap > 0.45 * min(pw, cc[2]):
+                nx = min(px, cc[0])
+                ny = min(py, cc[1])
+                right = max(px + pw, cc[0] + cc[2])
+                bottom = max(py + ph, cc[1] + cc[3])
+                merged[-1] = [nx, ny, right - nx, bottom - ny]
+            else:
+                merged.append(list(cc))
+        if len(merged) >= 2:
+            merged.sort(key=lambda item: item[0])
+            out.extend(tuple(int(v) for v in item) for item in merged)
+        else:
+            out.append((x, y, bw_, bh))
     return out
 
 
@@ -405,24 +528,50 @@ def segment_plate(img, assume_bgr=False, prefer_dark_text=None, debug=False,
     norm = _normalize_size(img)
     gray = to_gray(norm)
 
-    bw, polarity = binarize(gray, prefer_dark_text)
-    bw = morph(bw, 3, "close")
-    bw = _clean(bw)
+    def boxes_of(binary):
+        found = _boxes_from_projection(binary, min_char_width_ratio)
+        cut = _two_row_cut(binary)
+        if cut is not None:
+            top = _boxes_from_projection(binary[:cut], min_char_width_ratio)
+            bottom = [
+                (x, y + cut, w, h)
+                for (x, y, w, h) in _boxes_from_projection(binary[cut:], min_char_width_ratio)
+            ]
+            two_row = top + bottom
+            # 双行牌按整张图做垂直投影会把上下两字叠成一块。切开后字数更多时采用切开的结果。
+            if len(two_row) > len(found):
+                found = two_row
+        found = _tighten_single_row(found)
+        found = _merge_stroke_fragments(found)
+        return _split_wide_boxes(binary, found)
 
-    boxes = _boxes_from_projection(bw, min_char_width_ratio)
-    cut = _two_row_cut(bw)
-    if cut is not None:
-        top = _boxes_from_projection(bw[:cut], min_char_width_ratio)
-        bottom = [
-            (x, y + cut, w, h)
-            for (x, y, w, h) in _boxes_from_projection(bw[cut:], min_char_width_ratio)
-        ]
-        two_row = top + bottom
-        # 双行牌按整张图做垂直投影会把上下两字叠成一块。切开后字数更多时采用切开的结果。
-        if len(two_row) > len(boxes):
-            boxes = two_row
-    boxes = _tighten_single_row(boxes)
-    boxes = _merge_stroke_fragments(boxes)
+    def ink_from(local):
+        if local:
+            dark = _local_dark(gray)
+            ratio = float(dark.mean())
+            light = ~dark
+            if prefer_dark_text is True:
+                binary = dark if MIN_FG_RATIO <= ratio <= MAX_FG_RATIO else light
+            elif prefer_dark_text is False:
+                binary = light if MIN_FG_RATIO <= float(light.mean()) <= MAX_FG_RATIO else dark
+            else:
+                binary = dark if MIN_FG_RATIO <= ratio <= MAX_FG_RATIO else light
+        else:
+            binary, _pol = binarize(gray, prefer_dark_text)
+        binary = morph(binary, 3, "close")
+        binary = _peel_edge_bridge(binary)
+        binary = _clean(binary)
+        return binary
+
+    bw = ink_from(False)
+    polarity = bool(prefer_dark_text) if prefer_dark_text is not None else True
+    boxes = boxes_of(bw)
+    # 全局阈值已经切出 7 或 8 个字时不再换局部阈值，避免改动已经对上的牌。
+    if len(boxes) not in (7, 8):
+        local_bw = ink_from(True)
+        local_boxes = boxes_of(local_bw)
+        if len(local_boxes) in (6, 7, 8) and len(local_boxes) != len(boxes):
+            bw, boxes = local_bw, local_boxes
 
     chars = []
     for (x, y, ww, hh) in boxes:

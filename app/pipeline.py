@@ -38,10 +38,64 @@ from .runtime import LIBRARY_PATH, UserError, elapsed_ms, read_image_bgr, setup_
 LOG = setup_logging()
 
 
-def _box_with_border(bbox, shape) -> list[int]:
+def _restore_left_province(crop_bgr, boxes, chars, recognizer):
+    """左边部首被阈值切掉时，字会看成拉丁字母。把左边补上再认一次。
+
+    只在首位本来是字母、补上之后首位变成省份、而且相似度仍然够高时替换。
+    军牌首位本来就是字母，补出来的噪点到不了这个相似度，所以不会改。
+    """
+    if not boxes or not chars:
+        return chars
+    current = recognizer.recognize_char(chars[0], top_k=3)
+    if current.get("label") not in set("ABCDEFGHJKLMNPQRSTUVWXYZ"):
+        return chars
+    if not current.get("similarity"):
+        return chars
+    from vendor.b_plate.segment_chars import _norm_char, _normalize_size, to_gray
+    from vendor.c_char.labels import PROVINCES
+
+    rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+    gray = to_gray(_normalize_size(rgb))
+    height, width = gray.shape
+    ink = np.zeros_like(gray, dtype=bool)
+    window = max(20, width // 10)
+    for col in range(width):
+        x0 = max(0, col - window // 2)
+        x1 = min(width, x0 + window)
+        level = float(np.percentile(gray[:, x0:x1], 32))
+        ink[:, col] = gray[:, col] <= level
+    x, y, bw, bh = (int(v) for v in boxes[0])
+    xa = max(0, int(x - 0.40 * bw))
+    xb = min(width, x + bw)
+    ya = max(0, y - 2)
+    yb = min(height, y + bh + 2)
+    glyph = ink[ya:yb, xa:xb]
+    ys, xs = np.where(glyph)
+    if len(xs) < 8:
+        return chars
+    sub = glyph[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+    trial = recognizer.recognize_char((sub.astype(np.uint8) * 255), top_k=3)
+    if trial.get("label") not in PROVINCES or not trial.get("similarity"):
+        return chars
+    if trial["similarity"] < 0.80 or trial["similarity"] + 0.06 < current["similarity"]:
+        return chars
+    updated = list(chars)
+    updated[0] = _norm_char(sub)
+    return updated
+
+
+def _box_with_border(bbox, shape, color_hint=None) -> list[int]:
     """检测框贴着字符。往外留一圈边，把牌框算进定位，矫正仍用原来的四点。"""
     height, width = shape[:2]
     x, y, bw, bh = (int(v) for v in list(bbox)[:4])
+    # 远景绿牌的标注框常常把保险杠也圈进去。只把报出去的框放大，矫正仍用紧的四点。
+    if color_hint == "green" and bh < 0.045 * height and bw < 0.22 * width:
+        cx = x + bw / 2.0
+        cy = y + bh / 2.0
+        bw = max(bw, int(round(0.30 * width)))
+        bh = max(bh, int(round(0.15 * height)))
+        x = int(round(cx - bw / 2.0))
+        y = int(round(cy - bh / 2.0))
     pad_x = int(round(bw * 0.06))
     pad_y = int(round(bh * 0.10))
     x0 = max(0, x - pad_x)
@@ -162,7 +216,7 @@ class PlatePipeline:
         t0 = time.perf_counter()
         plate = {
             "index": index + 1,
-            "bbox": _box_with_border(det["bbox"], image_bgr.shape),
+            "bbox": _box_with_border(det["bbox"], image_bgr.shape, det.get("color_hint")),
             "quad": np.asarray(det.get("quad"), dtype=np.float32).tolist()
             if det.get("quad") is not None else None,
             "detect_score": float(det.get("detect_score", det.get("plate_score", 0.0))),
@@ -235,7 +289,7 @@ class PlatePipeline:
                 "no_char": "没有切出任何字符",
             }.get(seg["status"], ""),
         }
-        plate["chars"] = seg["chars"]
+        plate["chars"] = _restore_left_province(crop, seg["boxes"], seg["chars"], self.recognizer)
         stages = seg.get("stages", {})
         if stages:
             norm = stages.get("norm")
@@ -259,7 +313,7 @@ class PlatePipeline:
         t = time.perf_counter()
         layout = "standard" if seg["count"] in (7, 8) else "unrestricted"
         try:
-            recognition = self.recognizer.recognize_chars(seg["chars"], layout=layout, top_k=3)
+            recognition = self.recognizer.recognize_chars(plate["chars"], layout=layout, top_k=3)
         except Exception as exc:
             LOG.exception("字符识别失败")
             recognition = {"text": "", "status": "recognize_failed",
