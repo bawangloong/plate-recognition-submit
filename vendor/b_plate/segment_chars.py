@@ -218,7 +218,8 @@ def _merge_and_split(segs, bw, target_w):
         if merged:
             gap = a - merged[-1][1] - 1
             w_comb = b - merged[-1][0] + 1
-            if gap <= 2 and w_comb <= 1.30 * target_w:
+            # 间隙为 2 像素时多半是两个字挨着，不是断笔。断笔留给后面的碎片合并。
+            if gap <= 1 and w_comb <= 1.30 * target_w:
                 merged[-1] = (merged[-1][0], b)
                 continue
         merged.append((a, b))
@@ -312,8 +313,8 @@ def _merge_stroke_fragments(boxes):
             narrow = pw < 0.75 * ph or w < 0.75 * h
             union_w = x + w - px
             union_h = max(py + ph, y + h) - min(py, y)
-            # 只收重叠或只隔一两个像素的断笔。完整字符之间的空隙更大。
-            touch = gap <= 2
+            # 只收已经叠在一起的断笔。隔开两个像素的是两个字。
+            touch = gap <= 0
             if narrow and touch and union_w <= 1.45 * max(union_h, 1):
                 cur = [px, min(py, y), union_w, union_h]
             else:
