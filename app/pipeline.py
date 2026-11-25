@@ -38,6 +38,19 @@ from .runtime import LIBRARY_PATH, UserError, elapsed_ms, read_image_bgr, setup_
 LOG = setup_logging()
 
 
+def _box_with_border(bbox, shape) -> list[int]:
+    """检测框贴着字符。往外留一圈边，把牌框算进定位，矫正仍用原来的四点。"""
+    height, width = shape[:2]
+    x, y, bw, bh = (int(v) for v in list(bbox)[:4])
+    pad_x = int(round(bw * 0.06))
+    pad_y = int(round(bh * 0.10))
+    x0 = max(0, x - pad_x)
+    y0 = max(0, y - pad_y)
+    x1 = min(width, x + bw + pad_x)
+    y1 = min(height, y + bh + pad_y)
+    return [x0, y0, max(1, x1 - x0), max(1, y1 - y0)]
+
+
 def _progress(cb, stage: str, fraction: float, detail: str = "") -> None:
     if cb is None:
         return
@@ -149,7 +162,7 @@ class PlatePipeline:
         t0 = time.perf_counter()
         plate = {
             "index": index + 1,
-            "bbox": [int(v) for v in det["bbox"]],
+            "bbox": _box_with_border(det["bbox"], image_bgr.shape),
             "quad": np.asarray(det.get("quad"), dtype=np.float32).tolist()
             if det.get("quad") is not None else None,
             "detect_score": float(det.get("detect_score", det.get("plate_score", 0.0))),

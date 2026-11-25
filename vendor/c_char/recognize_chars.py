@@ -126,7 +126,13 @@ class CharacterRecognizer:
         for position, image in enumerate(characters):
             allowed = None
             if layout == "standard":
-                allowed = PROVINCES if position == 0 else LETTERS if position == 1 else DIGITS + LETTERS
+                # 民用牌首位是省份简称。军牌、港澳入出境牌首位是拉丁字母，不能只在省份里挑。
+                if position == 0:
+                    allowed = PROVINCES + LETTERS
+                elif position == 1:
+                    allowed = LETTERS
+                else:
+                    allowed = DIGITS + LETTERS
             result = self.recognize_char(image, allowed, top_k)
             results.append({"position": position, **result})
         has_invalid = any(result["status"] == "invalid_input" for result in results)

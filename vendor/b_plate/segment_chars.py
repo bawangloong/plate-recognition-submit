@@ -274,6 +274,55 @@ def _boxes_from_projection(bw, min_char_width_ratio):
     return boxes
 
 
+def _merge_stroke_fragments(boxes):
+    """同一行里贴在一起的窄笔画收成一个字。
+
+    汉字左右部首、字母的断开笔画在垂直投影里会变成两块。
+    相邻完整字符之间的空隙更大，这里不合进去。
+    """
+    if len(boxes) < 2:
+        return boxes
+    ordered = sorted(boxes, key=lambda b: (b[1] + b[3] / 2.0, b[0]))
+    rows = []
+    for box in ordered:
+        cy = box[1] + box[3] / 2.0
+        placed = False
+        for row in rows:
+            centers = [item[1] + item[3] / 2.0 for item in row]
+            height = max(item[3] for item in row)
+            if abs(cy - sum(centers) / len(centers)) <= 0.45 * height:
+                row.append(box)
+                placed = True
+                break
+        if not placed:
+            rows.append([box])
+
+    merged = []
+    for row in rows:
+        row.sort(key=lambda b: b[0])
+        cur = list(row[0])
+        for x, y, w, h in row[1:]:
+            px, py, pw, ph = cur
+            gap = x - (px + pw)
+            overlap = min(py + ph, y + h) - max(py, y)
+            if overlap < 0.45 * min(ph, h):
+                merged.append(tuple(int(v) for v in cur))
+                cur = [x, y, w, h]
+                continue
+            narrow = pw < 0.75 * ph or w < 0.75 * h
+            union_w = x + w - px
+            union_h = max(py + ph, y + h) - min(py, y)
+            # 只收重叠或只隔一两个像素的断笔。完整字符之间的空隙更大。
+            touch = gap <= 2
+            if narrow and touch and union_w <= 1.45 * max(union_h, 1):
+                cur = [px, min(py, y), union_w, union_h]
+            else:
+                merged.append(tuple(int(v) for v in cur))
+                cur = [x, y, w, h]
+        merged.append(tuple(int(v) for v in cur))
+    return merged
+
+
 def _tighten_single_row(boxes):
     """单行牌上，个别框被铆钉或边框拉高时，收回同一条字带。"""
     if len(boxes) < 4:
@@ -372,6 +421,7 @@ def segment_plate(img, assume_bgr=False, prefer_dark_text=None, debug=False,
         if len(two_row) > len(boxes):
             boxes = two_row
     boxes = _tighten_single_row(boxes)
+    boxes = _merge_stroke_fragments(boxes)
 
     chars = []
     for (x, y, ww, hh) in boxes:
