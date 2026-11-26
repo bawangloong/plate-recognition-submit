@@ -590,7 +590,13 @@ def detect_plates(image_bgr: np.ndarray, verbose: bool = False) -> list:
         region = _trim_stacked_cap(image_bgr, region)
         trimmed.append(region)
     extra = _yellow_glyph_rows(image_bgr, trimmed)
-    return trimmed + extra
+    present = trimmed + extra
+    # 黑底白字不在蓝黄绿白四种底色里。只补「一行浅色字、底色又不饱和」的牌，
+    # 并且避开已经检出的牌，避免把蓝牌白字再收一遍。
+    black_rows = _black_light_rows(image_bgr, present)
+    present = present + black_rows
+    full_black = _full_frame_black(image_bgr, present)
+    return present + full_black
 
 
 def _solid_runs(fill: np.ndarray, level: float):
@@ -734,6 +740,133 @@ def _yellow_glyph_rows(image_bgr: np.ndarray, existing: list):
         found.append(PlateRegion(bbox=box, quad=quad, angle=0.0, score=0.66,
                                  color_hint="yellow"))
     return found
+
+
+def _axis_region(box, score, color_hint):
+    x, y, w, h = (int(v) for v in box)
+    if w < 16 or h < 12:
+        return None
+    quad = [[x, y], [x + w - 1, y], [x + w - 1, y + h - 1], [x, y + h - 1]]
+    return PlateRegion(bbox=(x, y, w, h), quad=quad, angle=0.0,
+                       score=float(score), color_hint=color_hint)
+
+
+def _black_light_rows(image_bgr: np.ndarray, existing: list):
+    """黑底上的一行白字。澳牌是这种，蓝牌的白字饱和度更高，这里不收。"""
+    height, width = image_bgr.shape[:2]
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    masks = _color_masks(hsv)
+    colored = masks["blue"] | masks["yellow"] | masks["green"]
+    light = ((hsv[:, :, 2] >= 150) & (hsv[:, :, 1] <= 80)).astype(np.uint8) * 255
+    count, _, stats, _ = cv2.connectedComponentsWithStats(light, 8)
+    glyphs = []
+    for index in range(1, count):
+        x, y, w, h, area = (int(v) for v in stats[index])
+        if h < 16 or h > 0.28 * height or w < 6 or w > h * 1.6:
+            continue
+        if area < 0.22 * w * h:
+            continue
+        glyphs.append((x, y, w, h))
+    glyphs.sort(key=lambda item: item[1] + item[3] / 2.0)
+    rows = []
+    for glyph in glyphs:
+        center = glyph[1] + glyph[3] / 2.0
+        placed = False
+        for row in rows:
+            centers = [item[1] + item[3] / 2.0 for item in row]
+            med_h = float(np.median([item[3] for item in row]))
+            if abs(center - sum(centers) / len(centers)) <= 0.40 * med_h and abs(glyph[3] - med_h) <= 0.35 * med_h:
+                row.append(glyph)
+                placed = True
+                break
+        if not placed:
+            rows.append([glyph])
+    found = []
+    for row in rows:
+        if len(row) < 5:
+            continue
+        med_h = float(np.median([item[3] for item in row]))
+        med_w = float(np.median([item[2] for item in row]))
+        row = [item for item in row if abs(item[3] - med_h) <= 0.28 * med_h and item[2] < med_w * 2.2]
+        if len(row) < 5:
+            continue
+        row.sort()
+        xs = [item[0] for item in row]
+        pitch = float(np.median(np.diff(xs))) if len(xs) > 2 else med_w * 1.4
+        if pitch < 8:
+            continue
+        kept = [row[0]]
+        for glyph in row[1:]:
+            if glyph[0] - kept[-1][0] < pitch * 2.4:
+                kept.append(glyph)
+        if len(kept) < 5:
+            continue
+        x0 = min(item[0] for item in kept)
+        y0 = min(item[1] for item in kept)
+        x1 = max(item[0] + item[2] for item in kept)
+        y1 = max(item[1] + item[3] for item in kept)
+        extra = int(round(pitch * 1.15))
+        pad_y = int(round(med_h * 0.45))
+        nx = max(0, x0 - extra)
+        ny = max(0, y0 - pad_y)
+        nw = min(width - nx, x1 + extra - nx)
+        nh = min(height - ny, y1 + pad_y - ny)
+        if nh < 16 or not 2.0 <= nw / float(nh) <= 5.2:
+            continue
+        roi = hsv[ny:ny + nh, nx:nx + nw]
+        if float((roi[:, :, 2] < 110).mean()) < 0.45:
+            continue
+        if float(np.median(roi[:, :, 1])) > 90:
+            continue
+        if float(colored[ny:ny + nh, nx:nx + nw].mean()) / 255.0 > 0.22:
+            continue
+        box = (nx, ny, nw, nh)
+        if any(_iou_quad_bbox(box, region.bbox) > 0.25 for region in existing):
+            continue
+        region = _axis_region(box, 0.64, "black")
+        if region is not None:
+            found.append(region)
+    return found
+
+
+def _full_frame_black(image_bgr: np.ndarray, existing: list):
+    """画面本身就是一块黑牌时，普通颜色通道没有底色可检。
+
+    只接受又宽又暗、中间横着一排浅色字的图。矮的暗色带（保险杠、草地）不在这里。
+    """
+    height, width = image_bgr.shape[:2]
+    aspect = width / float(max(height, 1))
+    if not 2.3 <= aspect <= 4.6:
+        return []
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    if float(np.median(hsv[:, :, 2])) >= 85 or float(np.median(hsv[:, :, 1])) >= 80:
+        return []
+    light = ((hsv[:, :, 2] >= 150) & (hsv[:, :, 1] <= 80)).astype(np.uint8) * 255
+    count, _, stats, _ = cv2.connectedComponentsWithStats(light, 8)
+    glyphs = []
+    for index in range(1, count):
+        x, y, w, h, area = (int(v) for v in stats[index])
+        if h < 0.25 * height or h > 0.75 * height or w < 8 or w > 0.20 * width:
+            continue
+        if area < 0.15 * w * h:
+            continue
+        glyphs.append((x, y, w, h))
+    if len(glyphs) < 5:
+        return []
+    glyphs.sort()
+    med_y = float(np.median([item[1] + item[3] / 2.0 for item in glyphs]))
+    med_h = float(np.median([item[3] for item in glyphs]))
+    row = [item for item in glyphs if abs(item[1] + item[3] / 2.0 - med_y) <= 0.35 * med_h]
+    if len(row) < 5:
+        return []
+    span = max(item[0] + item[2] for item in row) - min(item[0] for item in row)
+    if span < 0.45 * width:
+        return []
+    box = (0, 0, width, height)
+    if any(_iou_quad_bbox(box, region.bbox) > 0.25 for region in existing):
+        return []
+    region = _axis_region(box, 0.62, "black")
+    return [] if region is None else [region]
 
 
 def draw_regions(image_bgr: np.ndarray, regions: list) -> np.ndarray:
