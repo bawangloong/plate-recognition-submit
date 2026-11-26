@@ -17,11 +17,11 @@ import numpy as np
 try:  # 作为包被 D 的 GUI 导入（python -m app / PyInstaller）
     from .build_library import IMAGE_SUFFIXES
     from .char_features import FEATURE_DIM, FEATURE_VERSION, character_feature
-    from .labels import ALL_LABELS, DIGITS, LETTERS, PROVINCES
+    from .labels import ALL_LABELS, DIGITS, LETTERS, PROVINCES, SPECIAL
 except ImportError:  # 直接在本目录下运行脚本时保持原用法
     from build_library import IMAGE_SUFFIXES
     from char_features import FEATURE_DIM, FEATURE_VERSION, character_feature
-    from labels import ALL_LABELS, DIGITS, LETTERS, PROVINCES
+    from labels import ALL_LABELS, DIGITS, LETTERS, PROVINCES, SPECIAL
 
 ROOT = Path(__file__).resolve().parent
 
@@ -173,10 +173,12 @@ class CharacterRecognizer:
         except (ValueError, OSError) as exc:
             return {"label": "?", "similarity": None, "margin": None,
                     "status": "invalid_input", "message": str(exc), "candidates": []}
+        if allowed_labels is None:
+            allowed_labels = [label for label in ALL_LABELS if label not in SPECIAL]
         result = self.rank_features(feature[None], allowed_labels, top_k)[0]
         return _prefer_closed_r(image, result)
 
-    def recognize_chars(self, characters, layout="standard", top_k=3):
+    def recognize_chars(self, characters, layout="standard", top_k=3, place_indices=None):
         """standard 为常见 7/8 位位置约束，unrestricted 为任意顺序字符。"""
         if layout not in {"standard", "unrestricted"}:
             raise ValueError("layout 须为 standard 或 unrestricted")
@@ -190,9 +192,12 @@ class CharacterRecognizer:
         if layout == "standard" and count not in (7, 8):
             return {**base, "status": "invalid_length", "warnings": ["常见车牌需 7 或 8 个字符，请检查 B 的分割结果"]}
         results = []
+        place = set(place_indices or [])
+        # 上下叠写的地名只在京、东、西、城里挑，不跟黑、冀比余弦。
+        place_labels = list("京东西城")
         for position, image in enumerate(characters):
-            allowed = None
-            if layout == "standard":
+            allowed = place_labels if position in place else None
+            if layout == "standard" and position not in place:
                 # 民用牌首位是省份简称。军牌、港澳入出境牌首位是拉丁字母，不能只在省份里挑。
                 if position == 0:
                     allowed = PROVINCES + LETTERS

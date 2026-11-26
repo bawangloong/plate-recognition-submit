@@ -372,6 +372,81 @@ def _split_wide_boxes(bw, boxes):
     return out
 
 
+def _stacked_cut(ink):
+    """一个框里上下叠着两个字时，中间有一整条空白。单字的孔洞不会横贯全宽。"""
+    h, w = ink.shape
+    if h < 28 or w < 8:
+        return None
+    row = ink.mean(axis=1)
+    lo, hi = int(h * 0.32), int(h * 0.68)
+    if hi <= lo + 3:
+        return None
+    best = None
+    start = None
+    for index in range(lo, hi):
+        if row[index] <= 0.04:
+            if start is None:
+                start = index
+        elif start is not None:
+            if index - start >= 3:
+                if best is None or index - start > best[1] - best[0]:
+                    best = (start, index)
+            start = None
+    if start is not None and hi - start >= 3:
+        if best is None or hi - start > best[1] - best[0]:
+            best = (start, hi)
+    if best is None:
+        return None
+    cut = (best[0] + best[1]) // 2
+    top_h, bot_h = cut, h - cut
+    if min(top_h, bot_h) < 0.40 * h:
+        return None
+    if not 0.70 <= top_h / float(bot_h) <= 1.45:
+        return None
+    if float(row[:cut].mean()) < 0.08 or float(row[cut:].mean()) < 0.08:
+        return None
+    return int(cut)
+
+
+def _split_stacked_boxes(binary, boxes):
+    """上下叠在同一列里的两个字拆开，并记下它们是地名用字。"""
+    out = []
+    place = []
+    ink = binary.astype(bool) if binary.dtype != bool else binary
+    for x, y, w, h in boxes:
+        crop = ink[y:y + h, x:x + w]
+        cut = _stacked_cut(crop)
+        if cut is None:
+            out.append((int(x), int(y), int(w), int(h)))
+            place.append(False)
+            continue
+        out.append((int(x), int(y), int(w), int(cut)))
+        out.append((int(x), int(y + cut), int(w), int(h - cut)))
+        place.append(True)
+        place.append(True)
+    return out, place
+
+
+def _drop_wide_pictograms(boxes, place):
+    """比旁边的字宽出一截、又接近正方形的图块不是字符。人力车图标就是这种。"""
+    if len(boxes) < 5:
+        return boxes, place
+    widths = sorted(box[2] for box in boxes)
+    median = widths[len(widths) // 2]
+    if median <= 0:
+        return boxes, place
+    kept_boxes, kept_place = [], []
+    for box, flag in zip(boxes, place):
+        _x, _y, w, h = box
+        aspect = w / float(max(h, 1))
+        # 汉字可以比数字宽，但不会又宽又接近正方形。人力车图标会。
+        if (not flag) and w >= 1.65 * median and 0.90 <= aspect <= 1.20:
+            continue
+        kept_boxes.append(box)
+        kept_place.append(flag)
+    return kept_boxes, kept_place
+
+
 def _boxes_from_projection(bw, min_char_width_ratio):
     """对一块二值图做垂直投影，返回该图坐标系里的字符框。"""
     h, w = bw.shape
@@ -573,6 +648,9 @@ def segment_plate(img, assume_bgr=False, prefer_dark_text=None, debug=False,
         if len(local_boxes) in (6, 7, 8) and len(local_boxes) != len(boxes):
             bw, boxes = local_bw, local_boxes
 
+    boxes, place = _split_stacked_boxes(bw, boxes)
+    boxes, place = _drop_wide_pictograms(boxes, place)
+
     chars = []
     for (x, y, ww, hh) in boxes:
         crop = bw[y:y + hh, x:x + ww]
@@ -586,7 +664,8 @@ def segment_plate(img, assume_bgr=False, prefer_dark_text=None, debug=False,
     else:
         status = "count_abnormal"
 
-    result = {"chars": chars, "boxes": boxes, "count": count, "status": status}
+    result = {"chars": chars, "boxes": boxes, "count": count, "status": status,
+              "place_indices": [index for index, flag in enumerate(place) if flag]}
     if debug:
         result["stages"] = {"norm": norm, "gray": gray, "bw": bw,
                             "polarity": polarity}

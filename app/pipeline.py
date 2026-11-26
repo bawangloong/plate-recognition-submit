@@ -283,6 +283,7 @@ class PlatePipeline:
             "count": seg["count"],
             "status": seg["status"],
             "boxes": [list(map(int, b)) for b in seg["boxes"]],
+            "place_indices": [int(i) for i in seg.get("place_indices") or []],
             "message": {
                 "ok": "",
                 "count_abnormal": f"分割出 {seg['count']} 个字符（常见为 7 或 8 个）",
@@ -313,7 +314,9 @@ class PlatePipeline:
         t = time.perf_counter()
         layout = "standard" if seg["count"] in (7, 8) else "unrestricted"
         try:
-            recognition = self.recognizer.recognize_chars(plate["chars"], layout=layout, top_k=3)
+            recognition = self.recognizer.recognize_chars(
+                plate["chars"], layout=layout, top_k=3,
+                place_indices=seg.get("place_indices") or [])
         except Exception as exc:
             LOG.exception("字符识别失败")
             recognition = {"text": "", "status": "recognize_failed",

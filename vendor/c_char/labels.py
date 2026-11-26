@@ -13,7 +13,9 @@ PROVINCE_FOLDERS = {
 DIGITS = "0123456789"
 LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"
 PROVINCES = "".join(PROVINCE_FOLDERS.values())
-ALL_LABELS = list(DIGITS + LETTERS + PROVINCES)
+# 使馆、港澳牌尾字、非机动车地名。不放进省份表，普通位置不会跟黑、冀抢。
+SPECIAL = "使东西城澳"
+ALL_LABELS = list(DIGITS + LETTERS + PROVINCES + SPECIAL)
 FOLDER_TO_LABEL = {char: char for char in DIGITS + LETTERS} | PROVINCE_FOLDERS
 LABEL_TO_FOLDER = {label: folder for folder, label in FOLDER_TO_LABEL.items()}
 
