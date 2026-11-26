@@ -17,13 +17,79 @@ import numpy as np
 try:  # 作为包被 D 的 GUI 导入（python -m app / PyInstaller）
     from .build_library import IMAGE_SUFFIXES
     from .char_features import FEATURE_DIM, FEATURE_VERSION, character_feature
-    from .labels import ALL_LABELS, DIGITS, LETTERS, PROVINCES
+    from .labels import ALL_LABELS, DIGITS, LETTERS, PROVINCES, SPECIAL
 except ImportError:  # 直接在本目录下运行脚本时保持原用法
     from build_library import IMAGE_SUFFIXES
     from char_features import FEATURE_DIM, FEATURE_VERSION, character_feature
-    from labels import ALL_LABELS, DIGITS, LETTERS, PROVINCES
+    from labels import ALL_LABELS, DIGITS, LETTERS, PROVINCES, SPECIAL
 
 ROOT = Path(__file__).resolve().parent
+
+
+def _enclosed_hole(image) -> bool:
+    """白字里有没有被笔画包住的洞。R 有一个，W 没有。"""
+    arr = np.asarray(image)
+    if arr.ndim == 3:
+        arr = arr.max(axis=2)
+    if arr.dtype == np.bool_:
+        ink = arr
+    else:
+        ink = arr > (127 if arr.max() > 1 else 0.5)
+    if ink.size == 0 or int(ink.sum()) < 8:
+        return False
+    background = ~ink
+    height, width = background.shape
+    seen = np.zeros((height, width), dtype=bool)
+    stack = []
+    for x in range(width):
+        if background[0, x]:
+            stack.append((0, x))
+        if background[height - 1, x]:
+            stack.append((height - 1, x))
+    for y in range(height):
+        if background[y, 0]:
+            stack.append((y, 0))
+        if background[y, width - 1]:
+            stack.append((y, width - 1))
+    while stack:
+        y, x = stack.pop()
+        if y < 0 or x < 0 or y >= height or x >= width or seen[y, x] or not background[y, x]:
+            continue
+        seen[y, x] = True
+        stack.append((y - 1, x))
+        stack.append((y + 1, x))
+        stack.append((y, x - 1))
+        stack.append((y, x + 1))
+    holes = background & ~seen
+    return int(holes.sum()) >= 4
+
+
+def _prefer_closed_r(image, result):
+    """R 和 W 的余弦分差很小时，用有没有封闭孔来选。
+
+    只在前两名正好是 R 和 W、而且分差很小的时候改结果。其它字不动。
+    """
+    candidates = result.get("candidates") or []
+    if len(candidates) < 2:
+        return result
+    if {candidates[0]["label"], candidates[1]["label"]} != {"R", "W"}:
+        return result
+    if candidates[0]["similarity"] - candidates[1]["similarity"] > 0.08:
+        return result
+    want = "R" if _enclosed_hole(image) else "W"
+    if result.get("label") == want:
+        return result
+    chosen = next(item for item in candidates if item["label"] == want)
+    other = next(item for item in candidates if item["label"] != want)
+    updated = dict(result)
+    updated["label"] = chosen["label"]
+    updated["similarity"] = chosen["similarity"]
+    margin = chosen["similarity"] - other["similarity"]
+    updated["margin"] = margin
+    needs_review = chosen["similarity"] < 0.75 or margin < 0.02
+    updated["status"] = "needs_review" if needs_review else "ok"
+    updated["message"] = "匹配较弱或候选相近，建议复核" if needs_review else ""
+    return updated
 
 
 def natural_key(path):
@@ -107,9 +173,12 @@ class CharacterRecognizer:
         except (ValueError, OSError) as exc:
             return {"label": "?", "similarity": None, "margin": None,
                     "status": "invalid_input", "message": str(exc), "candidates": []}
-        return self.rank_features(feature[None], allowed_labels, top_k)[0]
+        if allowed_labels is None:
+            allowed_labels = [label for label in ALL_LABELS if label not in SPECIAL]
+        result = self.rank_features(feature[None], allowed_labels, top_k)[0]
+        return _prefer_closed_r(image, result)
 
-    def recognize_chars(self, characters, layout="standard", top_k=3):
+    def recognize_chars(self, characters, layout="standard", top_k=3, place_indices=None):
         """standard 为常见 7/8 位位置约束，unrestricted 为任意顺序字符。"""
         if layout not in {"standard", "unrestricted"}:
             raise ValueError("layout 须为 standard 或 unrestricted")
@@ -123,10 +192,19 @@ class CharacterRecognizer:
         if layout == "standard" and count not in (7, 8):
             return {**base, "status": "invalid_length", "warnings": ["常见车牌需 7 或 8 个字符，请检查 B 的分割结果"]}
         results = []
+        place = set(place_indices or [])
+        # 上下叠写的地名只在京、东、西、城里挑，不跟黑、冀比余弦。
+        place_labels = list("京东西城")
         for position, image in enumerate(characters):
-            allowed = None
-            if layout == "standard":
-                allowed = PROVINCES if position == 0 else LETTERS if position == 1 else DIGITS + LETTERS
+            allowed = place_labels if position in place else None
+            if layout == "standard" and position not in place:
+                # 民用牌首位是省份简称。军牌、港澳入出境牌首位是拉丁字母，不能只在省份里挑。
+                if position == 0:
+                    allowed = PROVINCES + LETTERS
+                elif position == 1:
+                    allowed = LETTERS
+                else:
+                    allowed = DIGITS + LETTERS
             result = self.recognize_char(image, allowed, top_k)
             results.append({"position": position, **result})
         has_invalid = any(result["status"] == "invalid_input" for result in results)

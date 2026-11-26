@@ -366,6 +366,9 @@ class ABackend:
 
         self.dir = Path(module_dir)
         self.name = f"A 模块（{self.dir.name}）"
+        # detect_plate.py 用普通 import 找同目录的 plate_common。
+        if str(self.dir) not in sys.path:
+            sys.path.insert(0, str(self.dir))
         for mod_name in ("detect_plate", "rectify_plate"):
             path = self.dir / f"{mod_name}.py"
             if not path.is_file():
@@ -380,12 +383,27 @@ class ABackend:
         if not hasattr(self.detect_plate, "detect_plates"):
             raise AttributeError("detect_plate.py 必须提供 detect_plates(image)")
 
+    @staticmethod
+    def _region_fields(item):
+        """A 返回的是 PlateRegion，旧约定是字典。两种都读。"""
+        if isinstance(item, dict):
+            return item, item
+        if hasattr(item, "to_dict"):
+            return item.to_dict(), item
+        data = {
+            "bbox": getattr(item, "bbox", None),
+            "quad": getattr(item, "quad", None),
+            "score": getattr(item, "score", 0.5),
+        }
+        return data, item
+
     def detect(self, bgr: np.ndarray) -> list[dict]:
         out = self.detect_plate.detect_plates(bgr)
         results = []
         for item in out or []:
-            bbox = item.get("bbox")
-            quad = item.get("quad")
+            data, region = self._region_fields(item)
+            bbox = data.get("bbox")
+            quad = data.get("quad")
             if bbox is None and quad is not None:
                 bbox = _bbox_of_quad(np.asarray(quad), bgr.shape)
             if bbox is None:
@@ -393,16 +411,27 @@ class ABackend:
             results.append({
                 "bbox": tuple(int(v) for v in bbox[:4]),
                 "quad": np.asarray(quad, dtype=np.float32) if quad is not None else None,
-                "detect_score": float(item.get("score", 0.5)),
-                "plate_score": float(item.get("score", 0.5)),
+                "detect_score": float(data.get("score", 0.5)),
+                "plate_score": float(data.get("score", 0.5)),
+                "color_hint": data.get("color_hint", "unknown"),
                 "source": "a_module",
+                "_region": region,
             })
         return results
 
     def rectify(self, bgr: np.ndarray, detection: dict) -> np.ndarray | None:
         func = getattr(self.rectify_plate, "rectify_plate", None)
-        if func is not None:
-            return func(bgr, detection)
+        region = detection.get("_region")
+        if func is not None and region is not None and not isinstance(region, dict):
+            try:
+                result = func(bgr, region)
+            except Exception:
+                result = None
+            image = getattr(result, "image", result)
+            if isinstance(image, np.ndarray) and image.size > 0:
+                return image
+        if detection.get("quad") is None:
+            return None
         return rectify_from_quad(bgr, detection["quad"])
 
 
