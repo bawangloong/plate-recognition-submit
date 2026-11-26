@@ -84,6 +84,74 @@ def _restore_left_province(crop_bgr, boxes, chars, recognizer):
     return updated
 
 
+def _prepend_wan_when_left_window_beats_letter(image_bgr, det, plate, recognizer):
+    """蓝牌只剩六位、首位是字母时，才到四点左边单独找皖。
+
+    窗口的最高标签必须正好是皖，而且相似度要高于 0.910。不够就保持原牌。
+    已经切出的六个字和它们的框不动，四点本身也不扩大。黄牌和已经是七位、
+    八位的牌不进这里。
+    """
+    text = plate.get("text") or ""
+    color = (plate.get("color") or {}).get("color")
+    from vendor.c_char.labels import LETTERS
+
+    if color != "blue" or len(text) != 6 or text[0] not in LETTERS:
+        return
+    region = det.get("_region")
+    quad = getattr(region, "quad", None)
+    if region is None or isinstance(region, dict) or quad is None:
+        return
+    from dataclasses import replace
+
+    from vendor.a_plate.rectify_plate import rectify_plate
+
+    points = np.asarray(quad, dtype=np.float32)
+    if points.shape != (4, 2):
+        return
+    top_left, top_right, bottom_right, bottom_left = points
+    best = 0.0
+    for frac in (0.22, 0.28):
+        extended = np.array([
+            top_left + (top_left - top_right) * frac,
+            top_right,
+            bottom_right,
+            bottom_left + (bottom_left - bottom_right) * frac,
+        ], dtype=np.float32)
+        try:
+            crop = rectify_plate(image_bgr, replace(region, quad=extended.tolist())).image
+        except (ValueError, cv2.error):
+            continue
+        if crop is None or crop.size == 0:
+            continue
+        height, width = crop.shape[:2]
+        if min(height, width) < 24:
+            continue
+        for width_ratio in (0.10, 0.12):
+            win_w = max(12, int(round(width * width_ratio)))
+            win_h = max(16, int(round(height * 0.62)))
+            if win_w >= width * 0.45 or win_h >= height:
+                continue
+            x_stop = int(width * 0.36) - win_w
+            for x in range(0, max(1, x_stop), 3):
+                for y in range(0, max(1, height - win_h), 4):
+                    result = recognizer.recognize_char(crop[y:y + win_h, x:x + win_w], top_k=1)
+                    if result.get("label") != "皖":
+                        continue
+                    similarity = float(result.get("similarity") or 0.0)
+                    if similarity > best:
+                        best = similarity
+    if best <= 0.910:
+        return
+    plate["text"] = "皖" + text
+    recognition = plate.get("recognition") or {}
+    recognition["text"] = plate["text"]
+    plate["recognition"] = recognition
+    segmentation = plate.setdefault("segmentation", {})
+    segmentation["count"] = int(segmentation.get("count") or 0) + 1
+    if segmentation["count"] in (7, 8):
+        segmentation["status"] = "ok"
+
+
 def _insert_missing_black_digit(crop_bgr, boxes, chars, recognizer):
     """黑牌少切出一个数字时，从闭运算之前的浅色笔画里把那个字补回来。
 
@@ -471,6 +539,7 @@ class PlatePipeline:
         plate["recognition"] = recognition
         plate["text"] = recognition.get("text", "") or ""
         _apply_black_char_priors(plate, self.recognizer)
+        _prepend_wan_when_left_window_beats_letter(image_bgr, det, plate, self.recognizer)
 
         sims = [c.get("similarity") for c in recognition.get("characters", [])
                 if c.get("similarity") is not None]
